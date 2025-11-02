@@ -331,9 +331,9 @@ def plot_results(prices_df: pd.DataFrame, schedule_df: pd.DataFrame, region: str
     plt.xticks(rotation=45)
 
     # Add explanatory text box
-    explanation_text = f"""Battery Arbitrage Economics:
+    explanation_text = f"""Home battery Economics:
 
-Revenue (Green): Income from selling electricity during high-price hours
+Revenue (Green): Savings from using stored electricity during high-price hours
 • Battery discharges when spot prices are highest
 • Accounts for round-trip efficiency losses ({efficiency:.1%})
 
@@ -341,11 +341,11 @@ Cost (Red): Expense of buying electricity during low-price hours
 • Battery charges when spot prices are lowest
 • Raw charging costs before efficiency losses
 
-Profit (Blue): Net earnings from arbitrage opportunity
+Profit (Blue): Net earnings from home battery system
 • Revenue - Cost = Daily profit
 • Cumulative profit shows total savings over time
 
-Strategy: Buy low, sell high using time-shifted consumption"""
+Strategy: Buy low, use at high using time-shifted consumption"""
 
     plt.text(0.02, 0.98, explanation_text,
              transform=plt.gca().transAxes,
