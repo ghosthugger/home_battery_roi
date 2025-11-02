@@ -25,6 +25,50 @@ from pathlib import Path
 import json
 
 
+def fetch_single_day(region: str, date_str: str) -> pd.DataFrame:
+    """
+    Fetch hourly electricity prices for a single day from mgrey.se API.
+
+    Args:
+        region: Bidding zone (SE1, SE2, SE3, SE4)
+        date_str: Date in YYYY-MM-DD format
+
+    Returns:
+        DataFrame with columns: timestamp, price_sek_per_kwh
+    """
+    all_data = []
+    url = f"https://mgrey.se/espot?format=json&date={date_str}"
+
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        # Parse the response for the specific region
+        if region in data:
+            for hour_data in data[region]:
+                # Create timestamp from date and hour
+                timestamp = datetime.strptime(date_str, "%Y-%m-%d") + timedelta(hours=hour_data['hour'])
+                # Convert from öre/kWh to SEK/kWh
+                price_sek_per_kwh = hour_data['price_sek'] / 100.0
+
+                all_data.append({
+                    'timestamp': timestamp,
+                    'price_sek_per_kwh': price_sek_per_kwh
+                })
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"API request failed: {e}")
+    except (KeyError, ValueError) as e:
+        raise Exception(f"Data parsing failed: {e}")
+
+    df = pd.DataFrame(all_data)
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+    return df
+
+
 def fetch_prices(region: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     Fetch hourly electricity prices from mgrey.se API.
@@ -97,9 +141,9 @@ def cache_prices_to_sqlite(df: pd.DataFrame, region: str):
 
     conn = sqlite3.connect('battery_roi_cache.db')
 
-    # Create table if it doesn't exist
+    # Create table if it doesn't exist, append new data
     table_name = f"prices_{region.lower()}"
-    df.to_sql(table_name, conn, if_exists='replace', index=False)
+    df.to_sql(table_name, conn, if_exists='append', index=False)
 
     # Create index on timestamp for faster queries
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp ON {table_name}(timestamp)")
@@ -405,47 +449,67 @@ def main():
 
     print(f"Fetching/caching price data for {args.region} from {args.start} to {args.end}...")
 
-    # Try to load from cache first
+    # Smart caching: Load existing data and fetch only missing dates
+    start_date = datetime.strptime(args.start, "%Y-%m-%d")
+    end_date = datetime.strptime(args.end, "%Y-%m-%d")
+
+    # Load any existing cached data
     prices_df = load_prices_from_cache(args.region, args.start, args.end)
 
-    # Check if we have complete data for the requested range
-    start_date = datetime.strptime(args.start, "%Y-%m-%d")
-    end_date = datetime.strptime(args.end, "%Y-%m-%d")
-    total_days_requested = (end_date - start_date).days + 1
-    expected_records = total_days_requested * 24  # 24 hours per day
+    # Generate list of all expected dates
+    expected_dates = []
+    current_date = start_date
+    while current_date <= end_date:
+        expected_dates.append(current_date.date())
+        current_date += timedelta(days=1)
 
-    if prices_df.empty or len(prices_df) < expected_records:
-        if prices_df.empty:
-            print("No cached data found. Fetching from API...")
-        else:
-            cached_days = len(prices_df) // 24 if len(prices_df) % 24 == 0 else (len(prices_df) // 24) + 1
-            print(f"Partial cached data found ({len(prices_df)} records = ~{cached_days} days). Fetching complete dataset...")
-
-        # Fetch complete dataset
-        new_prices_df = fetch_prices(args.region, args.start, args.end)
-        if not new_prices_df.empty:
-            # Cache the complete dataset (this will overwrite any existing cached data for this region)
-            cache_prices_to_sqlite(new_prices_df, args.region)
-            prices_df = new_prices_df
-            print(f"Cached {len(prices_df)} price records")
-        else:
-            if not prices_df.empty:
-                print("Failed to fetch new data, using partial cached data")
-            else:
-                print("Failed to fetch price data from API")
-                return
+    # Check which dates we have data for
+    if not prices_df.empty:
+        cached_dates = set(prices_df['timestamp'].dt.date.unique())
+        missing_dates = [d for d in expected_dates if d not in cached_dates]
     else:
-        print(f"Loaded {len(prices_df)} records from cache")
+        missing_dates = expected_dates
+
+    # Fetch missing data
+    if missing_dates:
+        if not prices_df.empty:
+            print(f"Found {len(cached_dates)} days in cache. Fetching {len(missing_dates)} missing days...")
+        else:
+            print(f"No cached data found. Fetching {len(missing_dates)} days from API...")
+
+        # Fetch missing dates in batches or individually
+        new_data_frames = []
+        for missing_date in missing_dates:
+            date_str = missing_date.strftime("%Y-%m-%d")
+            try:
+                day_df = fetch_single_day(args.region, date_str)
+                if not day_df.empty:
+                    new_data_frames.append(day_df)
+            except Exception as e:
+                print(f"Failed to fetch data for {date_str}: {e}")
+                continue
+
+        # Combine and cache new data
+        if new_data_frames:
+            new_prices_df = pd.concat(new_data_frames, ignore_index=True)
+            cache_prices_to_sqlite(new_prices_df, args.region)
+            print(f"Cached {len(new_prices_df)} additional price records")
+
+            # Reload complete dataset
+            prices_df = load_prices_from_cache(args.region, args.start, args.end)
+
+    if prices_df.empty:
+        print("Failed to load or fetch any price data")
+        return
+
+    print(f"Using {len(prices_df)} price records from cache")
 
     # Calculate total days in range and days with data
-    start_date = datetime.strptime(args.start, "%Y-%m-%d")
-    end_date = datetime.strptime(args.end, "%Y-%m-%d")
-    total_days_in_range = (end_date - start_date).days + 1
+    total_days_in_range = len(expected_dates)
 
     # Count days with data
     if not prices_df.empty:
-        prices_df['date'] = prices_df['timestamp'].dt.date
-        days_with_data = prices_df['date'].nunique()
+        days_with_data = len(prices_df['timestamp'].dt.date.unique())
         print(f"Date range: {total_days_in_range} days total")
         print(f"Days with price data: {days_with_data}")
     else:
