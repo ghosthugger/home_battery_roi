@@ -99,7 +99,7 @@ def cache_prices_to_sqlite(df: pd.DataFrame, region: str):
 
     # Create table if it doesn't exist
     table_name = f"prices_{region.lower()}"
-    df.to_sql(table_name, conn, if_exists='append', index=False)
+    df.to_sql(table_name, conn, if_exists='replace', index=False)
 
     # Create index on timestamp for faster queries
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp ON {table_name}(timestamp)")
@@ -276,7 +276,7 @@ def calculate_roi(schedule_df: pd.DataFrame, prices_df: pd.DataFrame, battery_co
     }
 
 
-def plot_results(prices_df: pd.DataFrame, schedule_df: pd.DataFrame, region: str):
+def plot_results(prices_df: pd.DataFrame, schedule_df: pd.DataFrame, region: str, efficiency: float):
     """
     Generate plots showing battery optimization results.
 
@@ -319,18 +319,44 @@ def plot_results(prices_df: pd.DataFrame, schedule_df: pd.DataFrame, region: str
     schedule_df['cumulative_cost'] = schedule_df['charge_cost_sek'].cumsum()
     schedule_df['cumulative_revenue'] = schedule_df['discharge_revenue_sek'].cumsum()
 
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(14, 8))
     plt.plot(schedule_df['date'], schedule_df['cumulative_revenue'], 'g-', label='Cumulative Revenue', linewidth=2)
     plt.plot(schedule_df['date'], schedule_df['cumulative_cost'], 'r-', label='Cumulative Cost', linewidth=2)
     plt.plot(schedule_df['date'], schedule_df['cumulative_profit'], 'b-', label='Cumulative Profit', linewidth=2)
-    plt.title(f'Cumulative Revenue vs Cost ({region})')
+    plt.title(f'Cumulative Revenue vs Cost ({region})', fontsize=14, pad=20)
     plt.xlabel('Date')
     plt.ylabel('SEK')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xticks(rotation=45)
+
+    # Add explanatory text box
+    explanation_text = f"""Battery Arbitrage Economics:
+
+Revenue (Green): Income from selling electricity during high-price hours
+• Battery discharges when spot prices are highest
+• Accounts for round-trip efficiency losses ({efficiency:.1%})
+
+Cost (Red): Expense of buying electricity during low-price hours
+• Battery charges when spot prices are lowest
+• Raw charging costs before efficiency losses
+
+Profit (Blue): Net earnings from arbitrage opportunity
+• Revenue - Cost = Daily profit
+• Cumulative profit shows total savings over time
+
+Strategy: Buy low, sell high using time-shifted consumption"""
+
+    plt.text(0.02, 0.98, explanation_text,
+             transform=plt.gca().transAxes,
+             fontsize=9,
+             verticalalignment='top',
+             horizontalalignment='left',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.8),
+             family='monospace')
+
     plt.tight_layout()
-    plt.savefig(plots_dir / f'cumulative_roi_{region}.png', dpi=150)
+    plt.savefig(plots_dir / f'cumulative_roi_{region}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     # 3. Battery utilization histogram
@@ -382,26 +408,68 @@ def main():
     # Try to load from cache first
     prices_df = load_prices_from_cache(args.region, args.start, args.end)
 
-    if prices_df.empty:
-        print("No cached data found. Fetching from API...")
-        prices_df = fetch_prices(args.region, args.start, args.end)
-        if not prices_df.empty:
-            cache_prices_to_sqlite(prices_df, args.region)
+    # Check if we have complete data for the requested range
+    start_date = datetime.strptime(args.start, "%Y-%m-%d")
+    end_date = datetime.strptime(args.end, "%Y-%m-%d")
+    total_days_requested = (end_date - start_date).days + 1
+    expected_records = total_days_requested * 24  # 24 hours per day
+
+    if prices_df.empty or len(prices_df) < expected_records:
+        if prices_df.empty:
+            print("No cached data found. Fetching from API...")
+        else:
+            cached_days = len(prices_df) // 24 if len(prices_df) % 24 == 0 else (len(prices_df) // 24) + 1
+            print(f"Partial cached data found ({len(prices_df)} records = ~{cached_days} days). Fetching complete dataset...")
+
+        # Fetch complete dataset
+        new_prices_df = fetch_prices(args.region, args.start, args.end)
+        if not new_prices_df.empty:
+            # Cache the complete dataset (this will overwrite any existing cached data for this region)
+            cache_prices_to_sqlite(new_prices_df, args.region)
+            prices_df = new_prices_df
             print(f"Cached {len(prices_df)} price records")
         else:
-            print("Failed to fetch price data from API")
-            return
+            if not prices_df.empty:
+                print("Failed to fetch new data, using partial cached data")
+            else:
+                print("Failed to fetch price data from API")
+                return
     else:
         print(f"Loaded {len(prices_df)} records from cache")
 
+    # Calculate total days in range and days with data
+    start_date = datetime.strptime(args.start, "%Y-%m-%d")
+    end_date = datetime.strptime(args.end, "%Y-%m-%d")
+    total_days_in_range = (end_date - start_date).days + 1
+
+    # Count days with data
+    if not prices_df.empty:
+        prices_df['date'] = prices_df['timestamp'].dt.date
+        days_with_data = prices_df['date'].nunique()
+        print(f"Date range: {total_days_in_range} days total")
+        print(f"Days with price data: {days_with_data}")
+    else:
+        days_with_data = 0
+        print(f"Date range: {total_days_in_range} days total")
+        print("Days with price data: 0")
+
     print("Optimizing battery schedule...")
     schedule_df = optimize_battery_schedule(prices_df, args.capacity, args.efficiency)
+
+    if not schedule_df.empty:
+        days_processed = len(schedule_df)
+        print(f"Days processed (complete 24h data): {days_processed}")
+        if days_with_data > 0:
+            skip_percentage = ((days_with_data - days_processed) / days_with_data) * 100
+            print(f"Days skipped due to incomplete data: {skip_percentage:.1f}%")
+    else:
+        print("Days processed (complete 24h data): 0")
 
     print("Calculating ROI...")
     roi_results = calculate_roi(schedule_df, prices_df, args.cost, args.capacity, args.efficiency)
 
     print("Generating plots...")
-    plot_results(prices_df, schedule_df, args.region)
+    plot_results(prices_df, schedule_df, args.region, args.efficiency)
 
     # Print results
     print("\n--- Battery ROI Summary ---")
